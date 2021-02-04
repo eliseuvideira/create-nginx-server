@@ -1,0 +1,150 @@
+#!/bin/bash
+
+PROGNAME="${0##*/}"
+
+usage() {
+  cat <<__EOF__
+Usage: $PROGNAME DOMAIN EMAIL PROXY_PASS STAGING
+
+Where:
+  DOMAIN is the domain to create a certificate. ex: subdomain.domain.com
+  EMAIL is a valid email to authenticate letsencrypt. ex: email@mail.com
+  PROXY_PASS is redirect url to proxy. ex: http://localhost:8003
+  STAGING is a flag to set development or production. 1 for development, 0 to production
+
+Example:
+  $PROGNAME subdomain.domain.com email@mail.com http://localhost:8003 0
+
+__EOF__
+}
+
+if (($# == 4)); then
+  domain=$1
+  email=$2
+  proxy_pass=$3
+  staging=$4
+else
+  usage
+  exit 1
+fi
+
+if ! [ -x "$(command -v docker-compose)" ]; then
+  echo 'Error: docker-compose is not installed.' >&2
+  exit 1
+fi
+
+mkdir -p ./data/nginx/domains
+
+cat <<__EOF__ > "./data/nginx/domains/$domain.conf"
+server {
+  listen 80;
+  listen [::]:80;
+  server_name $domain;
+
+  location /.well-known/acme-challenge/ {
+    root /var/www/certbot;
+  }
+
+  return 301 https://$host$request_uri;
+}
+
+server {
+  listen 443 ssl http2;
+  listen [::]:443 ssl http2;
+  server_name $domain;
+  ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+  client_max_body_size 60M;
+
+  location /.well-known/acme-challenge/ {
+    root /var/www/certbot;
+  }
+
+  location / {
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header Host $http_host;
+    proxy_pass $proxy_pass;
+  }
+
+  include /etc/nginx/extra-conf.d/*.conf;
+  include /etc/letsencrypt/options-ssl-nginx.conf;
+  ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+}
+__EOF__
+
+usage
+exit 1
+
+domains=($domain)
+rsa_key_size=4096
+data_path="./data/certbot"
+email=$email
+staging=$staging
+
+if [ -d "$data_path/$domain" ]; then
+  read -p "Existing data found for $domains. Continue and replace existing certificate? (y/N) " decision
+  if [ "$decision" != "Y" ] && [ "$decision" != "y" ]; then
+    exit
+  fi
+fi
+
+
+if [ ! -e "$data_path/conf/options-ssl-nginx.conf" ] || [ ! -e "$data_path/conf/ssl-dhparams.pem" ]; then
+  echo "### Downloading recommended TLS parameters ..."
+  mkdir -p "$data_path/conf"
+  curl -s https://raw.githubusercontent.com/certbot/certbot/master/certbot-nginx/certbot_nginx/_internal/tls_configs/options-ssl-nginx.conf > "$data_path/conf/options-ssl-nginx.conf"
+  curl -s https://raw.githubusercontent.com/certbot/certbot/master/certbot/certbot/ssl-dhparams.pem > "$data_path/conf/ssl-dhparams.pem"
+  echo
+fi
+
+echo "### Creating dummy certificate for $domains ..."
+path="/etc/letsencrypt/live/$domains"
+mkdir -p "$data_path/conf/live/$domains"
+docker-compose run --rm --entrypoint "\
+  openssl req -x509 -nodes -newkey rsa:$rsa_key_size -days 1\
+    -keyout '$path/privkey.pem' \
+    -out '$path/fullchain.pem' \
+    -subj '/CN=localhost'" certbot
+echo
+
+
+echo "### Starting nginx ..."
+docker-compose up --force-recreate -d nginx
+echo
+
+echo "### Deleting dummy certificate for $domains ..."
+docker-compose run --rm --entrypoint "\
+  rm -Rf /etc/letsencrypt/live/$domains && \
+  rm -Rf /etc/letsencrypt/archive/$domains && \
+  rm -Rf /etc/letsencrypt/renewal/$domains.conf" certbot
+echo
+
+
+echo "### Requesting Let's Encrypt certificate for $domains ..."
+#Join $domains to -d args
+domain_args=""
+for domain in "${domains[@]}"; do
+  domain_args="$domain_args -d $domain"
+done
+
+# Select appropriate email arg
+case "$email" in
+  "") email_arg="--register-unsafely-without-email" ;;
+  *) email_arg="--email $email" ;;
+esac
+
+# Enable staging mode if needed
+if [ $staging != "0" ]; then staging_arg="--staging"; fi
+
+docker-compose run --rm --entrypoint "\
+  certbot certonly --webroot -w /var/www/certbot \
+    $staging_arg \
+    $email_arg \
+    $domain_args \
+    --rsa-key-size $rsa_key_size \
+    --agree-tos \
+    --force-renewal" certbot
+echo
+
+echo "### Reloading nginx ..."
+docker-compose exec nginx nginx -s reload
