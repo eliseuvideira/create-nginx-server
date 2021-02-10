@@ -72,9 +72,6 @@ server {
 }
 __EOF__
 
-usage
-exit 1
-
 domains=($domain)
 rsa_key_size=4096
 data_path="./data/certbot"
